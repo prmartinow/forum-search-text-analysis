@@ -1,71 +1,77 @@
-# Search indexing for forum_data.db
+# Forum Text Analysis: 4-Layer Intelligence Extraction Engine
 
-This repo wires the scraped forum SQLite database for BM25 full-text search plus semantic embeddings (via sqlite-vec for fast KNN) and exposes a small exploration UI with keyword/hybrid/semantic search plus label previews.
+A streamlined, headless knowledge extraction and epistemic classification engine for scraped forum databases. Powered by local LLM gateway / Gemini Bridge to extract structured entities, pricing, claims, and post metadata into SQLite.
 
-## Prereqs
-- Python 3.10+ and SQLite 3.44+ (FTS5 is built-in).
-- Install deps inside a venv: `pip install -r requirements.txt && pip install sqlite-vec`
-- Configure `.env` (loaded automatically by the app):
+---
+
+## The 4 Knowledge Layers
+
+| Layer | Focus | Stored Table | Key Attributes |
+| :--- | :--- | :--- | :--- |
+| **Layer A** | **Entity & Location Catalog** | `entities` | Named entities, venues, providers, locations/districts, operational status (*active, moved, closed*), context. |
+| **Layer B** | **Transactional & Market Intel** | `pricing_records` | Numeric prices, currency, duration in mins, price type (*hourly, entry fee, tip, extra*), verbatim mention snippet. |
+| **Layer C** | **Claims & Epistemic Labeling** | `claims` | Claim type, claim text, epistemic status (*first_hand, operational_fact, hearsay, inquiry*), sentiment, warning flag (`is_warning`), evidence quote (<=25 words), confidence. |
+| **Layer D** | **Post Classification & Summary** | `post_classifications` | Primary intent (*field_report, inquiry, operational_update, warning_alert, banter_meta*), sentiment, information density (*high, medium, low*), 1-sentence summary. |
+
+---
+
+## Setup & Prerequisites
+
+- **Python 3.10+** (Python 3.11 recommended).
+- **LLM Gateway / Gemini Bridge Running** (OpenAI-compatible `/v1/chat/completions`).
+- **Install dependencies:**
+  ```bash
+  uv venv .venv --python 3.11
+  uv pip install --python .venv/bin/python -r requirements.txt
   ```
-  OPENAI_API_KEY=<your-api-key>
-  DATABASE_PATH=data/forum_data.db
-  VEC_EXTENSION=.venv/lib/python3.13/site-packages/sqlite_vec/vec0
-  ```
 
-## Browse posts in the web UI
-- Start the app (after activating the venv): `.venv/bin/python app.py --host 0.0.0.0 --port 5000` and open http://localhost:5000
-- Modes: keyword (BM25), semantic (vector KNN), or hybrid (BM25 + vector). Filters include date range and timeline view; evidence cards show embedding/file badges and per-mode scores.
-- Post detail pages show metadata, embeddings, attachments, and full text.
-- `/labels` page previews the first 10 posts with stored labels/claims; snippets are expandable/collapsible.
+---
 
-## 1) Create the FTS + embeddings schema
-Run once to add the FTS5 table/triggers and the embeddings table:
+## Usage
+
+### 1. Run Multi-Layer Extraction Pipeline
+Process posts matching an optional date filter:
 ```bash
-sqlite3 data/forum_data.db < sql/search_schema.sql
-```
-
-## 2) Embed posts (and optionally write to sqlite-vec)
-The script embeds any posts missing in `post_embeddings` and keeps `posts_fts` in sync:
-```bash
-OPENAI_API_KEY=<your-api-key> python scripts/prepare_search.py \
+.venv/bin/python run_extraction.py \
   --db data/forum_data.db \
-  --model text-embedding-3-small \
-  --batch-size 64 \
-  --vec-extension .venv/lib/python3.13/site-packages/sqlite_vec/vec0
-```
-Flags:
-- `--limit N` only embeds the first N eligible posts.
-- `--recompute-existing` re-embeds everything (overwrites existing rows).
-- `--max-chars N` trims long comments before embedding.
-- `--vec-extension /path/to/vec0.so --vec-dims 1536` also creates/fills `post_vec` for sqlite-vec KNN search (dimensions default from embeddings if you omit `--vec-dims`).
-- If you change to a model with a different vector dimension, drop/clear `post_embeddings` (and `post_vec`) first to avoid mixed sizes.
-
-## Query examples
-- BM25 (lower `kw_score` is better):
-```sql
-SELECT p.id, p.posted_at,
-       bm25(posts_fts) AS kw_score,
-       snippet(posts_fts, 0, '[', ']', '...', 15) AS snippet
-FROM posts_fts
-JOIN posts p ON p.id = posts_fts.rowid
-WHERE posts_fts MATCH 'bali rental'
-ORDER BY kw_score
-LIMIT 20;
+  --start-date 2021-01-01 \
+  --batch-size 20 \
+  --delay 3.1
 ```
 
-- sqlite-vec (requires `.load`ing the vec0 extension first in your client):
-```sql
-SELECT post_id, distance
-FROM post_vec
-WHERE embedding MATCH vec_f32('[0.1, 0.2, ...]')
-ORDER BY distance
-LIMIT 20;
+### Options:
+- `--db <path>`: Path to target forum SQLite database containing `posts` table.
+- `--model <name>`: Model identifier (default: `gemini-3.1-flash-lite`).
+- `--start-date <YYYY-MM-DD>`: Filter posts starting from this date.
+- `--end-date <YYYY-MM-DD>`: Filter posts up to this date.
+- `--limit <N>`: Maximum number of posts to process.
+- `--batch-size <N>`: Number of posts bundled per LLM request (default: `20`).
+- `--delay <sec>`: Quiet time delay between API batches (default: `3.1`s for Gemini queue).
+- `--recompute`: Re-process and overwrite previously extracted posts.
+
+### 2. Query Extracted Intelligence
+Explore extracted data directly from the terminal:
+```bash
+# High-level dataset summary
+.venv/bin/python query_intel.py --summary
+
+# Top mentioned entities
+.venv/bin/python query_intel.py --entities --limit 20
+
+# Extracted pricing data points
+.venv/bin/python query_intel.py --pricing --limit 20
+
+# Safety warnings and red flags
+.venv/bin/python query_intel.py --warnings --limit 20
 ```
 
-- Hybrid idea: take the top ~200 BM25 hits and the top ~50 vector hits, union on `post_id`, normalize scores in a small script, and re-rank before passing the texts to an LLM.
+---
 
-## Tables created
-- `posts_fts` virtual table + triggers: keeps BM25 search over `posts.comment`.
-- `post_embeddings`: one float32 blob per `posts.id`, with model name and dimension info.
-- `post_vec` (optional): sqlite-vec float array for KNN if you load the extension.
-- `post_labels` / `post_claims`: populated by `scripts/label_posts.py` (OpenAI Responses API) for the labels preview page.
+## Database Schema (`schema.sql`)
+
+The extraction pipeline automatically applies `schema.sql` to the target database:
+- `post_extractions`: Raw JSON output, token metrics, extraction timestamps.
+- `post_classifications`: Post-level intent, sentiment, information density, summary.
+- `entities`: Named entities, categories, areas, and statuses.
+- `pricing_records`: Dissected economic numbers, services, currencies.
+- `claims`: Epistemically qualified claims, direct evidence quotes, warnings.

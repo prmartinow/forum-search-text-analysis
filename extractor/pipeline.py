@@ -1,8 +1,11 @@
-"""Batch extraction execution pipeline with progress tracking and rate pacing."""
+"""Batch extraction execution pipeline with progress tracking, rate pacing, and optional rules-based pre-cleaning."""
 
+import json
 import logging
+import os
+import re
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 from extractor.config import config
@@ -10,6 +13,22 @@ from extractor.client import GeminiBridgeClient
 from extractor.db import DatabaseManager
 
 logger = logging.getLogger(__name__)
+
+def load_sanitization_rules(rules_path: Optional[str]) -> List[Tuple[re.Pattern, str]]:
+    """Load optional user-defined regex replacements from an external configuration file."""
+    if not rules_path or not os.path.exists(rules_path):
+        return []
+    try:
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            raw_rules = json.load(f)
+        compiled: List[Tuple[re.Pattern, str]] = []
+        for entry in raw_rules:
+            if 'pattern' in entry and 'replacement' in entry:
+                compiled.append((re.compile(entry['pattern'], re.IGNORECASE), entry['replacement']))
+        return compiled
+    except Exception as exc:
+        logger.warning(f"Could not load sanitization rules from {rules_path}: {exc}")
+        return []
 
 class ExtractionPipeline:
     def __init__(
@@ -23,6 +42,13 @@ class ExtractionPipeline:
         self.client = GeminiBridgeClient(model=model)
         self.batch_size = batch_size or config.batch_size
         self.rate_limit_delay = rate_limit_delay if rate_limit_delay is not None else config.rate_limit_delay
+        self.rules = load_sanitization_rules(config.sanitization_rules_file)
+
+    def _clean_text(self, text: str) -> str:
+        res = text
+        for pattern, replacement in self.rules:
+            res = pattern.sub(replacement, res)
+        return res
 
     def run(
         self,
@@ -32,10 +58,8 @@ class ExtractionPipeline:
         offset: Optional[int] = None,
         recompute: bool = False
     ) -> Dict[str, Any]:
-        # 1. Ensure extraction tables exist
         self.db.init_schema()
 
-        # 2. Load eligible posts matching criteria
         posts = self.db.load_eligible_posts(
             start_date=start_date,
             end_date=end_date,
@@ -66,14 +90,15 @@ class ExtractionPipeline:
                         'post_id': p['id'],
                         'author': p['author'],
                         'date': p['posted_at'],
-                        'text': p['comment'][:3000]
+                        'text': self._clean_text(p['comment'][:3000])
                     }
                     for p in batch
                 ]
 
                 try:
                     res = self.client.extract_batch(batch_payload)
-                    parsed_posts = res['data'] if isinstance(res['data'], list) else res['data'].get('posts', [])
+                    raw_data = res['data']
+                    parsed_posts = raw_data if isinstance(raw_data, list) else raw_data.get('posts', [])
 
                     self.db.save_batch_extractions(
                         extracted_posts=parsed_posts,
@@ -88,8 +113,6 @@ class ExtractionPipeline:
                     pbar.update(len(batch))
 
                 except Exception as exc:
-                    # Batch-level error (e.g. one post triggered upstream safety filter).
-                    # Isolate individual posts so the remaining non-filtered posts succeed.
                     if len(batch) > 1:
                         pbar.write(f"Batch {b_idx + 1} encountered filter ({exc}). Isolating individual posts...")
                         for single_post in batch:
@@ -99,11 +122,17 @@ class ExtractionPipeline:
                                 'post_id': single_post['id'],
                                 'author': single_post['author'],
                                 'date': single_post['posted_at'],
-                                'text': single_post['comment'][:3000]
+                                'text': self._clean_text(single_post['comment'][:3000])
                             }]
                             try:
                                 s_res = self.client.extract_batch(single_payload)
-                                s_parsed = s_res['data'] if isinstance(s_res['data'], list) else s_res['data'].get('posts', [])
+                                s_data = s_res['data']
+                                s_parsed = s_data if isinstance(s_data, list) else s_data.get('posts', [])
+                                if not isinstance(s_parsed, list):
+                                    s_parsed = [s_parsed]
+                                for item in s_parsed:
+                                    if not item.get('post_id'):
+                                        item['post_id'] = single_post['id']
                                 self.db.save_batch_extractions(
                                     extracted_posts=s_parsed,
                                     raw_json_str=s_res['raw_json'],
@@ -115,7 +144,6 @@ class ExtractionPipeline:
                                 total_tokens += (s_res['prompt_tokens'] + s_res['completion_tokens'])
                                 pbar.update(1)
                             except Exception as s_exc:
-                                # Post is strictly filtered by upstream; mark as filtered so it won't stall subsequent runs
                                 self.db.save_batch_extractions(
                                     extracted_posts=[{
                                         'post_id': single_post['id'],
@@ -140,7 +168,6 @@ class ExtractionPipeline:
                         pbar.write(f"Post {batch[0]['id']} failed: {exc}")
                         pbar.update(len(batch))
 
-                # Respect Gemini Bridge queue quiet time
                 if b_idx < len(batches) - 1 and self.rate_limit_delay > 0:
                     time.sleep(self.rate_limit_delay)
 

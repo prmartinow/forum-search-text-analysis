@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,5 +14,6 @@ class Config:
     rate_limit_delay: float = float(os.getenv('RATE_LIMIT_DELAY', '3.1'))
     max_retries: int = int(os.getenv('MAX_RETRIES', '3'))
     temperature: float = float(os.getenv('TEMPERATURE', '0.1'))
+    sanitization_rules_file: Optional[str] = os.getenv('SANITIZATION_RULES_FILE')
 
 config = Config()

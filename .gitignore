@@ -6,3 +6,5 @@ data/
 .env.jsonschema
 .env.sysmsg
 .venv/
+*rules*.json
+.sanitization_rules.json

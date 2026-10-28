@@ -5,6 +5,9 @@ import argparse
 import os
 import sqlite3
 import sys
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def main():
     parser = argparse.ArgumentParser(description="Query extracted forum intelligence.")

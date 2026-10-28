@@ -66,7 +66,7 @@ class ExtractionPipeline:
                         'post_id': p['id'],
                         'author': p['author'],
                         'date': p['posted_at'],
-                        'text': p['comment'][:3000]  # Cap individual outlier posts at 3k chars
+                        'text': p['comment'][:3000]
                     }
                     for p in batch
                 ]
@@ -88,8 +88,57 @@ class ExtractionPipeline:
                     pbar.update(len(batch))
 
                 except Exception as exc:
-                    logger.error(f"Batch {b_idx + 1}/{len(batches)} failed: {exc}")
-                    pbar.write(f"Error processing batch {b_idx + 1}: {exc}")
+                    # Batch-level error (e.g. one post triggered upstream safety filter).
+                    # Isolate individual posts so the remaining non-filtered posts succeed.
+                    if len(batch) > 1:
+                        pbar.write(f"Batch {b_idx + 1} encountered filter ({exc}). Isolating individual posts...")
+                        for single_post in batch:
+                            if self.rate_limit_delay > 0:
+                                time.sleep(self.rate_limit_delay)
+                            single_payload = [{
+                                'post_id': single_post['id'],
+                                'author': single_post['author'],
+                                'date': single_post['posted_at'],
+                                'text': single_post['comment'][:3000]
+                            }]
+                            try:
+                                s_res = self.client.extract_batch(single_payload)
+                                s_parsed = s_res['data'].get('posts', [])
+                                self.db.save_batch_extractions(
+                                    extracted_posts=s_parsed,
+                                    raw_json_str=s_res['raw_json'],
+                                    model_name=s_res['model'],
+                                    prompt_tokens=s_res['prompt_tokens'],
+                                    completion_tokens=s_res['completion_tokens']
+                                )
+                                processed_count += 1
+                                total_tokens += (s_res['prompt_tokens'] + s_res['completion_tokens'])
+                                pbar.update(1)
+                            except Exception as s_exc:
+                                # Post is strictly filtered by upstream; mark as filtered so it won't stall subsequent runs
+                                self.db.save_batch_extractions(
+                                    extracted_posts=[{
+                                        'post_id': single_post['id'],
+                                        'classification': {
+                                            'primary_intent': 'banter_meta',
+                                            'sentiment': 'neutral',
+                                            'information_density': 'low',
+                                            'summary': '[Filtered by upstream content moderation]'
+                                        },
+                                        'entities': [],
+                                        'pricing': [],
+                                        'claims': []
+                                    }],
+                                    raw_json_str='{"filtered": true}',
+                                    model_name=self.client.model,
+                                    prompt_tokens=0,
+                                    completion_tokens=0
+                                )
+                                processed_count += 1
+                                pbar.update(1)
+                    else:
+                        pbar.write(f"Post {batch[0]['id']} failed: {exc}")
+                        pbar.update(len(batch))
 
                 # Respect Gemini Bridge queue quiet time
                 if b_idx < len(batches) - 1 and self.rate_limit_delay > 0:

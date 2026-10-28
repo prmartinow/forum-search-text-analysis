@@ -48,6 +48,9 @@ class GeminiBridgeClient:
                 duration = time.time() - t0
 
                 raw_content = response.choices[0].message.content
+                if not raw_content or not raw_content.strip():
+                    raise ValueError("Upstream model returned empty completion (filtered or empty candidate)")
+
                 parsed_json = json.loads(raw_content)
 
                 usage = getattr(response, 'usage', None)
@@ -66,6 +69,9 @@ class GeminiBridgeClient:
 
             except Exception as exc:
                 last_error = exc
+                if "empty completion" in str(exc).lower():
+                    # Upstream safety filter or empty candidate; break immediately to isolate
+                    break
                 logger.warning(
                     f"Attempt {attempt}/{config.max_retries} failed on Gemini Bridge: {exc}"
                 )
@@ -74,5 +80,5 @@ class GeminiBridgeClient:
                     time.sleep(backoff)
 
         raise RuntimeError(
-            f"All {config.max_retries} extraction attempts failed. Last error: {last_error}"
+            f"Extraction attempt failed. Last error: {last_error}"
         )

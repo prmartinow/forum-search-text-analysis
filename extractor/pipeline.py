@@ -73,7 +73,7 @@ class ExtractionPipeline:
 
                 try:
                     res = self.client.extract_batch(batch_payload)
-                    parsed_posts = res['data'].get('posts', [])
+                    parsed_posts = res['data'] if isinstance(res['data'], list) else res['data'].get('posts', [])
 
                     self.db.save_batch_extractions(
                         extracted_posts=parsed_posts,
@@ -103,7 +103,7 @@ class ExtractionPipeline:
                             }]
                             try:
                                 s_res = self.client.extract_batch(single_payload)
-                                s_parsed = s_res['data'].get('posts', [])
+                                s_parsed = s_res['data'] if isinstance(s_res['data'], list) else s_res['data'].get('posts', [])
                                 self.db.save_batch_extractions(
                                     extracted_posts=s_parsed,
                                     raw_json_str=s_res['raw_json'],
